@@ -1,0 +1,30 @@
+{
+  "name": "BGRemover",
+  "short_name": "BGRemover",
+  "description": "Remova o background das imagens sem esforço, tudo localmente no seu navegador.",
+  "lang": "pt-BR",
+  "background_color": "#0f182a",
+  "theme_color": "#eef2fe",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "pwa/narrow.png",
+      "type": "image/png",
+      "sizes": "720x1280",
+      "form_factor": "narrow"
+    },
+    {
+      "src": "pwa/wide.png",
+      "type": "image/png",
+      "sizes": "1280x720",
+      "form_factor": "wide"
+    }
+  ]
+}
