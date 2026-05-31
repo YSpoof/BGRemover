@@ -6,23 +6,35 @@
   import CheckIcon from "~icons/mdi/check";
   import ProgressBar from "$lib/components/ProgressBar.svelte";
   import { storage } from "$lib/services/storage";
+  import type {
+    QueueItem,
+    QueueItemStatus,
+    WorkerCompletePayload,
+    WorkerErrorPayload,
+    WorkerProgressPayload,
+  } from "$lib/types";
+
+  const supportedMimeTypes = new Set([
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/svg+xml",
+    "image/bmp",
+    "image/gif",
+  ]);
+
   const appState = $state({
     showIntro: storage.getItem("showIntro") ?? true,
     isLoading: false,
-    isProcessing: false,
-    isComplete: false,
-    currentTask: "",
-    selectedFile: null as File | null,
-    previewUrl: null as string | null,
-    processedPreviewUrl: null as string | null,
-    outputUrl: null as string | null,
-    outputFileName: "output.png",
+    isQueueRunning: false,
+    preloadTask: "",
+    queue: [] as QueueItem[],
+    activeItemId: null as string | null,
   });
 
-  const progress = new Tween(0, { duration: 300, easing: quadInOut });
+  const preloadProgress = new Tween(0, { duration: 300, easing: quadInOut });
 
-  let worker: Worker;
-  let activeObjectUrl: string | null = null;
+  let worker: Worker | null = null;
 
   const revokeObjectUrl = (url: string | null) => {
     if (url && url.startsWith("blob:")) {
@@ -30,119 +42,321 @@
     }
   };
 
-  const cleanupObjectUrl = () => {
-    if (activeObjectUrl) {
-      revokeObjectUrl(activeObjectUrl);
-      activeObjectUrl = null;
+  const makeOutputFileName = (name: string) => `${name.replace(/\.[^/.]+$/, "")}.png`;
+
+  const createQueueItem = (file: File): QueueItem => {
+    const previewUrl = URL.createObjectURL(file);
+
+    return {
+      id: crypto.randomUUID(),
+      file,
+      fileName: file.name,
+      previewUrl,
+      outputUrl: null,
+      outputFileName: makeOutputFileName(file.name),
+      status: "pending",
+      progress: 0,
+      task: "",
+      errorMessage: null,
+    };
+  };
+
+  const updateQueueItem = (itemId: string, updater: (item: QueueItem) => void) => {
+    const index = appState.queue.findIndex((item) => item.id === itemId);
+    if (index === -1) return;
+
+    updater(appState.queue[index]);
+  };
+
+  const markQueueItemError = (itemId: string, message: string) => {
+    updateQueueItem(itemId, (item) => {
+      item.status = "error";
+      item.errorMessage = message;
+      item.task = "error";
+      item.progress = 0;
+    });
+  };
+
+  const pendingCount = () => appState.queue.filter((item) => item.status === "pending" && item.file).length;
+  const completedCount = () => appState.queue.filter((item) => item.status === "complete").length;
+  const processingPosition = () => {
+    const finished = appState.queue.filter((item) => item.status === "complete" || item.status === "error").length;
+    return Math.min(finished + (appState.activeItemId ? 1 : 0), appState.queue.length);
+  };
+
+  const processNextPending = () => {
+    if (!worker) {
+      appState.isQueueRunning = false;
+      appState.activeItemId = null;
+      return;
     }
+
+    const nextItem = appState.queue.find((item) => item.status === "pending" && item.file);
+
+    if (!nextItem || !nextItem.file) {
+      appState.isQueueRunning = false;
+      appState.activeItemId = null;
+      return;
+    }
+
+    appState.isQueueRunning = true;
+    appState.activeItemId = nextItem.id;
+
+    updateQueueItem(nextItem.id, (item) => {
+      item.status = "processing";
+      item.errorMessage = null;
+      item.progress = 0;
+      item.task = "processing";
+    });
+
+    worker.postMessage({
+      type: "remove-bg",
+      payload: {
+        itemId: nextItem.id,
+        file: nextItem.file,
+      },
+    });
+  };
+
+  const startQueue = () => {
+    if (appState.isLoading || appState.isQueueRunning || !worker) return;
+    if (pendingCount() === 0) return;
+
+    processNextPending();
+  };
+
+  const initializeWorker = () => {
+    if (worker || appState.isLoading) return;
+
+    appState.isLoading = true;
+    appState.preloadTask = "";
+    preloadProgress.target = 0;
+
+    worker = new Worker(new URL("../lib/workers/bg-removal.worker.ts", import.meta.url), {
+      type: "module",
+    });
+    worker.onmessage = handleWorkerMessage;
+    worker.onerror = handleWorkerRuntimeError;
+    worker.onmessageerror = handleWorkerMessageError;
+    worker.postMessage({ type: "preload" });
   };
 
   const handleAcceptIntro = () => {
     appState.showIntro = false;
     storage.saveItem("showIntro", false);
-    appState.isLoading = true;
 
-    // Initialize worker and start preload
-    worker = new Worker(new URL("../lib/workers/bg-removal.worker.ts", import.meta.url), {
-      type: "module",
-    });
-    worker.onmessage = handleWorkerMessage;
-
-    // Offload preload to worker
-    worker.postMessage({
-      type: "preload",
-    });
+    initializeWorker();
   };
 
   const handleFileChange = (e: Event) => {
     const input = e.target as HTMLInputElement;
-    cleanupObjectUrl();
-    appState.outputUrl = null;
-    appState.processedPreviewUrl = null;
-    appState.isComplete = false;
-    appState.currentTask = "";
+    const files = Array.from(input.files ?? []);
 
-    if (input && input.files && input.files[0]) {
-      appState.selectedFile = input.files[0];
-      const previewUrl = URL.createObjectURL(input.files[0]);
-      appState.previewUrl = previewUrl;
-      activeObjectUrl = previewUrl;
-    } else {
-      appState.selectedFile = null;
-      appState.previewUrl = null;
+    if (!files.length)    return;
+
+    for (const file of files) {
+      if (!supportedMimeTypes.has(file.type)) {
+        appState.queue.push({
+          id: crypto.randomUUID(),
+          file: null,
+          fileName: file.name,
+          previewUrl: null,
+          outputUrl: null,
+          outputFileName: makeOutputFileName(file.name),
+          status: "error",
+          progress: 0,
+          task: "",
+          errorMessage: "Formato de arquivo nao suportado.",
+        });
+        continue;
+      }
+
+      appState.queue.push(createQueueItem(file));
     }
+
+    input.value = "";
   };
 
   const handleWorkerMessage = (event: MessageEvent) => {
-    const { type, payload } = event.data;
+    const { type, payload } = event.data as {
+      type: string;
+      payload?: unknown;
+    };
 
     if (type === "preload-complete") {
       appState.isLoading = false;
+      appState.preloadTask = "";
+      preloadProgress.target = 100;
     } else if (type === "progress") {
-      appState.currentTask = payload.key;
-      progress.target = payload.percent;
+      const progressPayload = payload as WorkerProgressPayload;
+
+      if (progressPayload.phase === "preload") {
+        appState.preloadTask = progressPayload.key;
+        preloadProgress.target = progressPayload.percent;
+        return;
+      }
+
+      if (progressPayload.phase === "remove" && progressPayload.itemId) {
+        updateQueueItem(progressPayload.itemId, (item) => {
+          item.task = progressPayload.key;
+          item.progress = progressPayload.percent;
+        });
+      }
     } else if (type === "complete") {
-      appState.isProcessing = false;
-      appState.currentTask = "";
-      appState.isComplete = true;
-      appState.selectedFile = null;
+      const completePayload = payload as WorkerCompletePayload;
 
-      cleanupObjectUrl();
-      const outputBlob = new Blob([payload.data], { type: payload.mimeType });
-      const outputUrl = URL.createObjectURL(outputBlob);
-      appState.previewUrl = outputUrl;
-      appState.processedPreviewUrl = outputUrl;
-      appState.outputUrl = outputUrl;
-      appState.outputFileName = payload.fileName ?? "output.png";
-      activeObjectUrl = outputUrl;
+      updateQueueItem(completePayload.itemId, (item) => {
+        revokeObjectUrl(item.outputUrl);
 
-      progress.target = 100;
+        const outputBlob = new Blob([completePayload.data], { type: completePayload.mimeType });
+        const outputUrl = URL.createObjectURL(outputBlob);
+
+        item.outputUrl = outputUrl;
+        item.outputFileName = completePayload.fileName ?? makeOutputFileName(item.fileName);
+        item.status = "complete";
+        item.progress = 100;
+        item.task = "";
+        item.errorMessage = null;
+      });
+
+      appState.activeItemId = null;
+      processNextPending();
     } else if (type === "error") {
-      console.error("Worker error:", payload.message);
-      appState.currentTask = "error";
-      appState.isProcessing = false;
-      appState.isLoading = false;
+      const errorPayload = payload as WorkerErrorPayload;
+
+      console.error("Worker error:", errorPayload.message);
+
+      if (errorPayload.phase === "preload") {
+        appState.preloadTask = "error";
+        appState.isLoading = false;
+        appState.isQueueRunning = false;
+        appState.activeItemId = null;
+        return;
+      }
+
+      if (errorPayload.itemId) {
+        markQueueItemError(errorPayload.itemId, errorPayload.message);
+      }
+
+      appState.activeItemId = null;
+      processNextPending();
     }
   };
 
-  const handleDownloadResult = () => {
-    if (!appState.outputUrl) return;
+  const handleWorkerRuntimeError = (event: ErrorEvent) => {
+    console.error("Worker runtime error:", event.message);
+
+    appState.isLoading = false;
+
+    if (appState.activeItemId) {
+      markQueueItemError(appState.activeItemId, "Falha inesperada no processamento.");
+    }
+
+    appState.activeItemId = null;
+    appState.isQueueRunning = false;
+  };
+
+  const handleWorkerMessageError = (_event: MessageEvent) => {
+    console.error("Worker message parsing error.");
+
+    appState.isLoading = false;
+
+    if (appState.activeItemId) {
+      markQueueItemError(appState.activeItemId, "Erro de comunicacao com o worker.");
+    }
+
+    appState.activeItemId = null;
+    appState.isQueueRunning = false;
+  };
+
+  const handleDownloadItem = (itemId: string) => {
+    const item = appState.queue.find((entry) => entry.id === itemId);
+
+    if (!item?.outputUrl) return;
 
     const link = document.createElement("a");
-    link.href = appState.outputUrl;
-    link.download = appState.outputFileName ?? "output.png";
+    link.href = item.outputUrl;
+    link.download = item.outputFileName;
     document.body.appendChild(link);
     link.click();
     link.remove();
   };
 
-  const handleRemoveBackground = async () => {
-    appState.isProcessing = true;
-    progress.target = 0;
-    appState.currentTask = "processing";
+  const removeQueueItem = (itemId: string) => {
+    const index = appState.queue.findIndex((item) => item.id === itemId);
+    if (index === -1) return;
 
-    if (appState.selectedFile) {
-      const file = appState.selectedFile;
-      worker.postMessage({
-        type: "remove-bg",
-        payload: { file },
-      });
-    } else {
-      appState.isProcessing = false;
+    const item = appState.queue[index];
+    if (item.status === "processing") return;
+
+    revokeObjectUrl(item.previewUrl);
+    revokeObjectUrl(item.outputUrl);
+    appState.queue.splice(index, 1);
+  };
+
+  const clearCompleted = () => {
+    const remaining: QueueItem[] = [];
+
+    for (const item of appState.queue) {
+      if (item.status === "complete") {
+        revokeObjectUrl(item.previewUrl);
+        revokeObjectUrl(item.outputUrl);
+      } else {
+        remaining.push(item);
+      }
+    }
+
+    appState.queue = remaining;
+  };
+
+  const retryItem = (itemId: string) => {
+    updateQueueItem(itemId, (item) => {
+      if (!item.file) return;
+
+      revokeObjectUrl(item.outputUrl);
+      item.outputUrl = null;
+      item.status = "pending";
+      item.progress = 0;
+      item.task = "";
+      item.errorMessage = null;
+    });
+  };
+
+  const getStatusLabel = (status: QueueItemStatus) => {
+    if (status === "pending") return "Pendente";
+    if (status === "processing") return "Processando";
+    if (status === "complete") return "Concluido";
+    return "Erro";
+  };
+
+  const getStatusClass = (status: QueueItemStatus) => {
+    if (status === "pending") return "badge-ghost";
+    if (status === "processing") return "badge-info";
+    if (status === "complete") return "badge-success";
+    return "badge-error";
+  };
+
+  const getPreviewSrc = (item: QueueItem) => item.outputUrl ?? item.previewUrl;
+
+  const cleanupQueueObjectUrls = () => {
+    for (const item of appState.queue) {
+      revokeObjectUrl(item.previewUrl);
+      revokeObjectUrl(item.outputUrl);
     }
   };
 
   onMount(() => {
     if (!appState.showIntro) {
-      handleAcceptIntro();
+      initializeWorker();
     }
   });
 
   onDestroy(() => {
     if (worker) {
       worker.terminate();
+      worker = null;
     }
-    cleanupObjectUrl();
+    cleanupQueueObjectUrls();
   });
 </script>
 
@@ -191,8 +405,8 @@
           <h2 class="card-title mt-4">Inicializando...</h2>
           <p class="text-sm text-base-content/70">Carregando dependências...</p>
           <ProgressBar
-            currentTask={appState.currentTask}
-            progress={progress.current}
+            currentTask={appState.preloadTask}
+            progress={preloadProgress.current}
           />
         </div>
       </div>
@@ -207,61 +421,144 @@
           <!-- File Input -->
           <div class="form-control w-full">
             <label class="label flex-col w-full">
-              <span class="label-text">Selecione a Imagem</span>
+              <span class="label-text">Selecione uma ou mais imagens</span>
               <input
                 onchange={handleFileChange}
                 type="file"
+                multiple
                 accept="image/jpeg,image/png,image/webp,image/svg+xml,image/bmp,image/gif"
                 class="file-input file-input-bordered w-full"
-                disabled={appState.isProcessing}
+                disabled={appState.isLoading}
               />
             </label>
           </div>
 
-          <!-- Preview Image -->
-          {#if appState.processedPreviewUrl ?? appState.previewUrl}
-            <div class="mt-4">
-              <img
-                src={appState.processedPreviewUrl ?? appState.previewUrl!}
-                alt={appState.isComplete ? "Imagem processada" : "Imagem original"}
-                class="w-full max-w-9/12 mx-auto object-contain rounded-lg"
-                class:animate-pulse={appState.isProcessing}
-              />
+          <div class="grid gap-2 mt-6 sm:grid-cols-2">
+            <button
+              onclick={startQueue}
+              disabled={appState.isQueueRunning || pendingCount() === 0}
+              class="btn btn-primary"
+            >
+              {#if appState.isQueueRunning}
+                <span class="loading loading-spinner loading-sm"></span>
+                Processando fila...
+              {:else}
+                Iniciar ({pendingCount()})
+              {/if}
+            </button>
+
+            <button
+              onclick={clearCompleted}
+              disabled={appState.isQueueRunning || completedCount() === 0}
+              class="btn btn-outline"
+            >
+              Limpar concluidos ({completedCount()})
+            </button>
+          </div>
+
+          {#if appState.queue.length > 0}
+            <div class="mt-6 space-y-4">
+              {#each appState.queue as item (item.id)}
+                <article
+                  class="card bg-base-200/60 border border-base-300"
+                  class:border-primary={item.id === appState.activeItemId}
+                >
+                  <div class="card-body p-4">
+                    <div class="flex flex-col gap-3 sm:flex-row">
+                      <div class="w-full sm:w-32 h-24 shrink-0 rounded-lg bg-base-300 overflow-hidden flex items-center justify-center">
+                        {#if getPreviewSrc(item)}
+                          <img
+                            src={getPreviewSrc(item)!}
+                            alt={item.status === "complete" ? "Imagem processada" : "Imagem original"}
+                            class="h-full w-full object-contain"
+                          />
+                        {:else}
+                          <span class="text-xs opacity-60 px-2 text-center">Sem preview</span>
+                        {/if}
+                      </div>
+
+                      <div class="flex-1 min-w-0">
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                          <h2 class="font-semibold truncate">{item.fileName}</h2>
+                          <span class={`badge ${getStatusClass(item.status)}`}>
+                            {getStatusLabel(item.status)}
+                          </span>
+                        </div>
+
+                        {#if item.errorMessage}
+                          <p class="text-sm text-error mt-1">{item.errorMessage}</p>
+                        {/if}
+
+                        <div class="mt-2">
+                          <div class="flex items-center justify-between text-xs opacity-80">
+                            <span class="truncate">
+                              {#if item.status === "pending"}
+                                Aguardando
+                              {:else if item.status === "processing"}
+                                {item.task || "processando"}
+                              {:else if item.status === "complete"}
+                                Concluido
+                              {:else}
+                                Falhou
+                              {/if}
+                            </span>
+                            <span>{item.progress.toFixed(0)}%</span>
+                          </div>
+                          <progress
+                            class="progress progress-primary w-full mt-1"
+                            value={item.progress}
+                            max="100"
+                          ></progress>
+                        </div>
+
+                        <div class="mt-3 flex flex-wrap gap-2">
+                          {#if item.status === "complete" && item.outputUrl}
+                            <button
+                              onclick={() => handleDownloadItem(item.id)}
+                              class="btn btn-sm btn-primary"
+                            >
+                              Baixar
+                            </button>
+                          {/if}
+
+                          {#if item.status === "error" && item.file}
+                            <button
+                              onclick={() => retryItem(item.id)}
+                              disabled={appState.isQueueRunning}
+                              class="btn btn-sm btn-outline"
+                            >
+                              Tentar novamente
+                            </button>
+                          {/if}
+
+                          <button
+                            onclick={() => removeQueueItem(item.id)}
+                            disabled={item.status === "processing"}
+                            class="btn btn-sm btn-error btn-ghost"
+                          >
+                            Remover
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </article>
+              {/each}
             </div>
+          {:else}
+            <p class="text-sm text-base-content/60 text-center mt-6">
+              Selecione arquivos para montar sua fila de processamento.
+            </p>
           {/if}
-
-          <!-- Progress Bar -->
-          {#if appState.isProcessing}
-            <ProgressBar
-              currentTask={appState.currentTask}
-              progress={progress.current}
-            />
-          {/if}
-
-          <!-- Process Button -->
-          <button
-            onclick={appState.isComplete ? handleDownloadResult : handleRemoveBackground}
-            disabled={appState.isProcessing || (!appState.selectedFile && !appState.isComplete)}
-            class="btn btn-primary w-full mt-6"
-          >
-            {#if appState.isProcessing}
-              <span class="loading loading-spinner loading-sm"></span>
-              Processando...
-            {:else if appState.isComplete}
-              Baixar imagem
-            {:else if appState.selectedFile}
-              Remover Background
-            {:else}
-              Selecione uma imagem primeiro
-            {/if}
-          </button>
 
           <!-- Info -->
           <p class="text-xs text-base-content/60 text-center mt-4">
-            {#if appState.isComplete}
-              Background removido com sucesso! Clique no botão para baixar o resultado.
+            {#if appState.isQueueRunning}
+              Processando {processingPosition()} de {appState.queue.length} arquivo(s).
+            {:else if completedCount() > 0}
+              {completedCount()} arquivo(s) concluido(s). Baixe individualmente ou adicione mais imagens.
             {:else}
-              Após o upload, clique no botão para remover o background.
+              Adicione imagens, inicie a fila e acompanhe o progresso de cada arquivo.
             {/if}
           </p>
         </div>

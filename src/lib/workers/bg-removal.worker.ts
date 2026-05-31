@@ -1,6 +1,10 @@
 import { removeBackground, preload, type Config } from "@imgly/background-removal";
+import type { IncomingMessage, WorkerPhase } from "$lib/types";
 
 const baseUrl = self.location.origin;
+
+let activePhase: WorkerPhase = "preload";
+let activeItemId: string | null = null;
 
 const config: Config = {
   device: "gpu",
@@ -11,9 +15,20 @@ const config: Config = {
     const percent = Math.round((current / total) * 100);
     self.postMessage({
       type: "progress",
-      payload: { key, current, total, percent },
+      payload: {
+        phase: activePhase,
+        itemId: activeItemId,
+        key,
+        current,
+        total,
+        percent,
+      },
     });
-    console.log(`Progress [${key}]: ${percent}% (${current}/${total})`);
+    if (activeItemId) {
+      console.log(`Progress [${activeItemId}] [${key}]: ${percent}% (${current}/${total})`);
+    } else {
+      console.log(`Progress [${key}]: ${percent}% (${current}/${total})`);
+    }
   },
   output: {
     format: "image/png",
@@ -22,9 +37,12 @@ const config: Config = {
 };
 
 self.onmessage = async (event: MessageEvent) => {
-  const { type, payload } = event.data;
+  const message = event.data as IncomingMessage;
 
-  if (type === "preload") {
+  if (message.type === "preload") {
+    activePhase = "preload";
+    activeItemId = null;
+
     try {
       await preload(config);
       self.postMessage({ type: "preload-complete" });
@@ -32,23 +50,28 @@ self.onmessage = async (event: MessageEvent) => {
       self.postMessage({
         type: "error",
         payload: {
+          phase: "preload",
+          itemId: null,
           message: error instanceof Error ? error.message : "Preload failed",
         },
       });
     }
-  } else if (type === "remove-bg") {
+  } else if (message.type === "remove-bg") {
+    const { file, itemId } = message.payload;
+
     try {
-      const { file } = payload;
+      activePhase = "remove";
+      activeItemId = itemId;
 
       const result = await removeBackground(file, config);
-      const outputFileName = file instanceof File
-        ? `${file.name.replace(/\.[^/.]+$/, "")}.png`
-        : "output.png";
+      const outputFileName =
+        file instanceof File ? `${file.name.replace(/\.[^/.]+$/, "")}.png` : "output.png";
       const arrayBuffer = await result.arrayBuffer();
 
       self.postMessage({
         type: "complete",
         payload: {
+          itemId,
           data: arrayBuffer,
           mimeType: result.type,
           fileName: outputFileName,
@@ -58,9 +81,13 @@ self.onmessage = async (event: MessageEvent) => {
       self.postMessage({
         type: "error",
         payload: {
+          phase: "remove",
+          itemId,
           message: error instanceof Error ? error.message : "Unknown error",
         },
       });
+    } finally {
+      activeItemId = null;
     }
   }
 };

@@ -1,3 +1,5 @@
+allowBuilds:
+  protobufjs: true
 onlyBuiltDependencies:
   - "@prisma/client"
   - better-sqlite3
